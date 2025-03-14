@@ -12,7 +12,7 @@ from epics import PV
 from pylablib.devices import M2
 
 # Import configuration parameters
-import .config
+import config
 
 
 ###############################################################################
