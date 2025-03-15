@@ -1,65 +1,57 @@
+#!/usr/bin/env python3
 import sys
 import time
 import threading
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QMessageBox, QDialog
+    QLabel, QLineEdit, QPushButton, QCheckBox, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer
 
 from epics import PV
 from pylablib.devices import M2
 
-# ---------------------------------------------------------------------------
-# Configuration Constants
-# ---------------------------------------------------------------------------
-
-# Laser connection parameters
-IP_ADDRESS = "192.168.1.222"
-PORT = 39933
-
-# EPICS Process Variable (PV) names
-WAVENUMBER_PV = "DBEL_RISE:MTER_N0002:FR_RD"
-DEBUG_MODE = True  # Set to False for production
-
-# PID controller parameters
-KP = 40.0
-KI = 0.8
-KD = 0.0
-
-# Dead time (seconds) for compensation
-DEAD_TIME = 0.2
-
-# Exponential Moving Average smoothing factor (alpha)
-EMA_ALPHA = 0.1
-
-# Default reading frequency in seconds
-READ_FREQ = 0.1
-
+###############################################################################
+#                           Configuration Dictionary                          #
+###############################################################################
+CONFIG = {
+    "ip_address": "192.168.1.222",
+    "port": 39933,
+    "frequency_pv": "DBEL_RISE:MTER_N0002:FR_RD",  # EPICS PV for frequency (THz)
+    "reading_frequency": 0.5,  # seconds between successive PV reads
+    "pid": {
+        "kp": 40.0,
+        "ki": 0.8,
+        "kd": 0.0,
+        "setpoint": 0.0  # Default setpoint (THz)
+    },
+    "update_delay": 0.2,  # Delay (in seconds) after each tuning command
+    "ema_alpha": 0.9      # Smoothing factor for exponential moving average (0 < alpha <= 1)
+}
 
 ###############################################################################
-#                  Minimal Classes for Reading, PID, and Laser Control        #
+#                          1. EPICS Frequency Reader                          #
 ###############################################################################
 
-class EMAServerReader:
+class EPICSFrequencyReader:
     """
-    Minimal reader for the frequency (in THz) from an EPICS PV in a background thread.
+    Continuously read the frequency (in THz) from an EPICS PV in a background thread.
     """
-    def __init__(self, pv_name, read_freq=READ_FREQ):
+    def __init__(self, pv_name, read_freq):
         """
         Args:
-            pv_name (str): The EPICS PV name that provides the frequency.
-            read_freq (float): Frequency (seconds) between successive reads.
+            pv_name (str): The EPICS PV name that provides the frequency in THz.
+            read_freq (float): Frequency (in seconds) between successive reads.
         """
         self._pv = PV(pv_name)
         self._read_freq = read_freq
         self._thread = None
         self._running = False
-        self._current_value = 0.0
+        self._current_freq = 0.0
 
     def start(self):
-        """Start continuously reading the frequency in a background thread."""
+        """Start continuously reading frequency in a background thread."""
         if self._running:
             return
         self._running = True
@@ -73,40 +65,35 @@ class EMAServerReader:
             self._thread.join()
 
     def _reading_loop(self):
+        """Background loop to read the EPICS PV."""
         while self._running:
             val = self._pv.get()
             if val is not None:
                 try:
-                    self._current_value = round(float(val), 5)
+                    self._current_freq = float(val)
                 except ValueError:
-                    self._current_value = 0.0
+                    pass
             time.sleep(self._read_freq)
 
-    def get_current_value(self):
-        """Return the latest frequency value read from EPICS."""
-        return self._current_value
+    def get_current_frequency(self):
+        """Return the latest frequency in THz from the EPICS PV."""
+        return self._current_freq
 
-    def set_read_frequency(self, new_read_freq):
-        """Update the reading frequency on the fly.
-
-        Args:
-            new_read_freq (float): New reading frequency in seconds.
-        """
-        self._read_freq = new_read_freq
-
+###############################################################################
+#                    2. Simple PID Controller for Laser Frequency            #
+###############################################################################
 
 class PIDController:
     """
-    A simple PID controller with dead time compensation.
+    A simple PID controller for locking the frequency to a setpoint (in THz).
     """
-    def __init__(self, kp, ki, kd, setpoint=0.0, dead_time=0.0):
+    def __init__(self, kp, ki, kd, setpoint=0.0):
         """
         Args:
-            kp (float): Proportional gain.
-            ki (float): Integral gain.
-            kd (float): Derivative gain.
-            setpoint (float): Desired target frequency.
-            dead_time (float): Time delay (in seconds) for compensation.
+            kp (float): Proportional gain
+            ki (float): Integral gain
+            kd (float): Derivative gain
+            setpoint (float): Desired frequency in THz
         """
         self.kp = kp
         self.ki = ki
@@ -118,98 +105,101 @@ class PIDController:
         self._prev_time = time.time()
         self._first_update = True
 
-        self.dead_time = dead_time
-        self._output_buffer = []  # Buffer for storing outputs with timestamps
-
     def update(self, current_value):
         """
-        Compute the correction based on the difference between setpoint and current_value,
-        and return the PID output delayed by the dead time.
-
-        Args:
-            current_value (float): The filtered measurement.
-
-        Returns:
-            float: PID correction output (possibly delayed).
+        Compute the correction based on the difference between setpoint and
+        current_value. Returns a float that the caller will use to tune the laser.
         """
         now = time.time()
-        error = self.setpoint - current_value
+        error = self.setpoint - current_value  # in THz
         dt = now - self._prev_time if not self._first_update else 0.0
         if dt <= 0:
             dt = 1e-6
 
+        # Integrate error
         self._integral += error * dt
+
+        # Derivative
         derivative = 0.0 if self._first_update else (error - self._prev_error) / dt
 
+        # PID output
         output = (self.kp * error) + (self.ki * self._integral) + (self.kd * derivative)
 
-        # Store the computed output with timestamp in the buffer
-        self._output_buffer.append((now, output))
-
+        # Update state
         self._prev_time = now
         self._prev_error = error
         self._first_update = False
 
-        # If dead time is set, only return the output that was computed 'dead_time' seconds ago
-        if self.dead_time > 0:
-            if self._output_buffer and (now - self._output_buffer[0][0] >= self.dead_time):
-                delayed_output = self._output_buffer.pop(0)[1]
-                return delayed_output
-            else:
-                # Not enough time has elapsed to use a delayed value
-                return 0.0
-        else:
-            return output
+        return output
 
     def set_setpoint(self, new_setpoint):
+        """Set a new frequency setpoint and reset internal states."""
         self.setpoint = new_setpoint
         self.reset()
 
     def reset(self):
-        """Reset PID internal states."""
+        """Reset the integral and error terms."""
         self._integral = 0.0
         self._prev_error = 0.0
         self._prev_time = time.time()
         self._first_update = True
-        self._output_buffer = []
 
+###############################################################################
+#                  3. Minimal Laser Controller using M2.Solstis              #
+###############################################################################
 
 class MinimalLaserController:
     """
-    A minimal controller to show:
-      1) Reading the frequency from an EPICS PV,
-      2) Locking/Unlocking the etalon, and
-      3) A PID control loop for stabilizing the frequency.
+    Uses:
+      - EPICSFrequencyReader to get the current frequency
+      - M2.Solstis to lock/unlock the etalon
+      - tune_laser_resonator() to adjust the resonator (coarse or fine)
+      - PID logic for closed-loop control
+      - A time delay after each tuning command to allow hardware to settle
+      - An exponential moving average (EMA) filter for noisy frequency readings.
     """
-    def __init__(self, ip_address, port, pv_name, kp, ki, kd):
+
+    def __init__(self, ip_address, port, freq_pv, pid_params, read_freq, update_delay, ema_alpha):
         """
         Args:
-            ip_address (str): IP address for the M2 SolsTiS Laser.
-            port (int): Port for the M2 SolsTiS Laser.
-            pv_name (str): EPICS PV name for the frequency.
-            kp, ki, kd (float): PID gains.
+            ip_address (str): IP address for the M2 Solstis laser.
+            port (int): Port for the M2 Solstis laser.
+            freq_pv (str): EPICS PV that reads out the laser frequency in THz.
+            pid_params (dict): Dictionary containing PID parameters (kp, ki, kd, setpoint).
+            read_freq (float): Seconds between EPICS PV reads.
+            update_delay (float): Delay (in seconds) after each tuning command.
+            ema_alpha (float): Smoothing factor for exponential moving average.
         """
-        # Connect to the M2 laser
+        # Connect to M2 laser
         self.laser = M2.Solstis(ip_address, port)
 
-        # Use a single etalon lock (initially unlocked)
+        # Single lock: "etalon" (only allow tuning if locked)
         self.etalon_lock_status = "off"
 
-        # Create the reader for the frequency from the EPICS PV
-        self.reader = EMAServerReader(pv_name, read_freq=READ_FREQ)
+        # Reader from EPICS
+        self.reader = EPICSFrequencyReader(freq_pv, read_freq)
 
-        # Create the PID controller with dead time compensation
-        self.pid = PIDController(kp, ki, kd, setpoint=0.0, dead_time=DEAD_TIME)
+        # PID controller for frequency locking
+        self.pid = PIDController(pid_params["kp"], pid_params["ki"], pid_params["kd"],
+                                 setpoint=pid_params["setpoint"])
 
         self._control_thread = None
         self._running = False
         self._pid_enabled = False
 
-        # For exponential moving average (EMA) filtering of the measurements
-        self._ema_value = None
+        # Additional delay time for hardware settling after tuning commands
+        self._update_delay = update_delay
 
+        # Flag for fine tuning (if True, call tune_laser_resonator with fine=True)
+        self.fine_tuning = False
+
+        # EMA parameters: smoothing factor and current EMA value
+        self.ema_alpha = ema_alpha
+        self._ema = None
+
+    ############# Start / Stop #############
     def start(self):
-        """Start reading and the PID control loop."""
+        """Start reading from EPICS and start the control loop thread."""
         self.reader.start()
         self._running = True
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
@@ -222,287 +212,214 @@ class MinimalLaserController:
         if self._control_thread:
             self._control_thread.join()
 
-    # --- Laser / Etalon Lock Methods ---
+    ############# Lock / Unlock #############
     def lock_etalon(self):
-        """Lock the etalon and update status."""
-        self.laser.lock_etalon()
+        """Lock the etalon in hardware and update local status."""
+        self.laser.lock_etalon()   # M2 method
         self.etalon_lock_status = "on"
 
     def unlock_etalon(self):
-        """Unlock the etalon and update status."""
-        self.laser.unlock_etalon()
+        """Unlock the etalon in hardware and update local status."""
+        self.laser.unlock_etalon() # M2 method
         self.etalon_lock_status = "off"
 
     def get_etalon_lock_status(self):
         return self.etalon_lock_status
 
-    # --- Laser Tuning Method ---
-    def tune_etalon(self, new_value):
-        """Tune the etalon to a new value."""
-        self.laser.tune_etalon(new_value, sync=True)
+    ############# Tuning the Resonator #############
+    def tune_resonator(self, fraction):
+        """
+        Tune the laser resonator to a given value (as a percentage).
+        If self.fine_tuning is True, perform a fine tune.
+        """
+        self.laser.tune_laser_resonator(value=fraction, fine=self.fine_tuning, sync=True)
 
-    # --- PID Control Methods ---
-    def set_target_frequency(self, freq):
-        """Set a new target frequency for the PID controller."""
-        self.pid.set_setpoint(freq)
+    ############# PID Control #############
+    def set_target_frequency(self, freq_thz):
+        """Set the new target frequency (in THz) for the PID loop."""
+        self.pid.set_setpoint(freq_thz)
 
     def enable_pid(self):
-        """Enable the PID control loop."""
+        """Enable the PID control loop (only if etalon lock is on)."""
+        if self.etalon_lock_status != "on":
+            print("Warning: Cannot enable PID since etalon is not locked.")
+            return
         self._pid_enabled = True
         self.pid.reset()
 
     def disable_pid(self):
-        """Disable the PID control loop."""
         self._pid_enabled = False
-
-    def update_pid_parameters(self, kp, ki, kd):
-        """Update the PID parameters."""
-        self.pid.kp = kp
-        self.pid.ki = ki
-        self.pid.kd = kd
-        self.pid.reset()
-
-    def get_current_tuner_value(self):
-        """
-        Retrieve the current etalon tuning value from the laser.
-        Returns:
-            float or None: Current tuner value, or None if not available.
-        """
-        try:
-            return float(self.laser.get_full_web_status()["etalon_tune"])
-        except Exception:
-            return None
 
     def _control_loop(self):
         """
-        Background loop for applying PID corrections to the etalon
-        when PID is enabled and the etalon is locked.
-        Uses an exponential moving average (EMA) of the measurements.
+        Background loop that:
+          1. Reads the current frequency.
+          2. Applies an exponential moving average (EMA) filter.
+          3. If PID is enabled and etalon is locked, calculates correction.
+          4. Adjusts the resonator using tune_laser_resonator.
+          5. Waits for _update_delay seconds before the next update.
         """
         while self._running:
-            if self._pid_enabled and (self.etalon_lock_status == "on"):
-                raw_value = self.reader.get_current_value()
-                if self._ema_value is None:
-                    self._ema_value = raw_value
-                else:
-                    self._ema_value = EMA_ALPHA * raw_value + (1 - EMA_ALPHA) * self._ema_value
+            raw_freq = self.reader.get_current_frequency()
+            if self._ema is None:
+                self._ema = raw_freq
+            else:
+                self._ema = self.ema_alpha * raw_freq + (1 - self.ema_alpha) * self._ema
 
-                correction = self.pid.update(self._ema_value)
+            if self._pid_enabled and self.etalon_lock_status == "on":
+                correction = self.pid.update(self._ema)
 
-                # Retrieve current etalon tuner value and apply the correction
-                current_etalon = self.get_current_tuner_value()
-                if current_etalon is not None:
-                    # Scale the correction as needed (here, multiplying by 0.1)
-                    new_val = current_etalon - correction * 0.1
-                    self.tune_etalon(new_val)
-            time.sleep(0.05)
+                # Retrieve current resonator fraction from full_web_status.
+                current_fraction = float(self.laser.get_full_web_status()["resonator_tune"])
 
+                # Scale correction to a fraction step (tweak as needed for your hardware)
+                fraction_step = correction * 5.0
+                new_fraction = current_fraction - fraction_step
+
+                # Bound within [0, 100]
+                new_fraction = max(0, min(100, new_fraction))
+
+                self.tune_resonator(new_fraction)
+
+                # Wait for hardware to settle
+                time.sleep(self._update_delay)
+            else:
+                time.sleep(0.05)
 
 ###############################################################################
-#                          PID Parameter Dialog                               #
+#                           4. PyQt5 GUI Implementation                        #
 ###############################################################################
 
-class PIDParameterDialog(QDialog):
+class MinimalLockGUI(QMainWindow):
     """
-    A dialog to update the PID parameters.
-    """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Update PID Parameters")
-        layout = QVBoxLayout(self)
-
-        # Input fields for kp, ki, kd
-        self.kp_input = QLineEdit(self)
-        self.ki_input = QLineEdit(self)
-        self.kd_input = QLineEdit(self)
-
-        layout.addWidget(QLabel("Proportional Gain (kp):", self))
-        layout.addWidget(self.kp_input)
-        layout.addWidget(QLabel("Integral Gain (ki):", self))
-        layout.addWidget(self.ki_input)
-        layout.addWidget(QLabel("Derivative Gain (kd):", self))
-        layout.addWidget(self.kd_input)
-
-        # Buttons for update and cancel
-        button_layout = QHBoxLayout()
-        self.ok_button = QPushButton("Update", self)
-        self.cancel_button = QPushButton("Cancel", self)
-        button_layout.addWidget(self.ok_button)
-        button_layout.addWidget(self.cancel_button)
-        layout.addLayout(button_layout)
-
-        self.ok_button.clicked.connect(self.accept)
-        self.cancel_button.clicked.connect(self.reject)
-
-    def get_parameters(self):
-        """
-        Returns:
-            tuple: (kp, ki, kd) as floats if valid, otherwise None.
-        """
-        try:
-            kp = float(self.kp_input.text())
-            ki = float(self.ki_input.text())
-            kd = float(self.kd_input.text())
-            return kp, ki, kd
-        except ValueError:
-            return None
-
-
-###############################################################################
-#                          Minimal PyQt5 GUI                                  #
-###############################################################################
-
-class MinimalGUI(QMainWindow):
-    """
-    A simple PyQt5 GUI for locking the etalon, updating PID parameters,
-    updating reading frequency, and stabilizing the frequency.
+    A simple PyQt5 GUI to:
+      - Display current frequency (THz)
+      - Lock/Unlock the etalon
+      - Enable/Disable PID
+      - Provide a target frequency input
+      - Toggle fine/coarse tuning
+      - Display status information in real time
     """
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Minimal Laser/Etalon Lock GUI")
-        self.setGeometry(100, 100, 400, 400)
+        self.setWindowTitle("Minimal Laser Resonator Lock with PID")
+        self.setGeometry(100, 100, 420, 300)
 
-        # Central widget and layout
+        # Main layout
         central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
-        vbox = QVBoxLayout(central_widget)
+        layout = QVBoxLayout(central_widget)
 
-        # Status label for etalon lock
-        self.status_label = QLabel("Etalon Lock Status: off", self)
-        vbox.addWidget(self.status_label, alignment=Qt.AlignCenter)
+        # 1) Current frequency display
+        freq_hbox = QHBoxLayout()
+        freq_hbox.addWidget(QLabel("Current Frequency (THz):"))
+        self.lbl_current_freq = QLabel("0.00000")
+        freq_hbox.addWidget(self.lbl_current_freq)
+        layout.addLayout(freq_hbox)
 
-        # Label to display current etalon tuning value
-        self.tune_label = QLabel("Current Etalon Tune Value: N/A", self)
-        vbox.addWidget(self.tune_label, alignment=Qt.AlignCenter)
+        # 2) Etalon lock status display
+        self.lbl_lock_status = QLabel("Etalon Lock Status: off")
+        layout.addWidget(self.lbl_lock_status)
 
-        # Target frequency input (in THz)
-        hbox_target = QHBoxLayout()
-        hbox_target.addWidget(QLabel("Target Frequency (THz):", self))
-        self.target_input = QLineEdit(self)
-        hbox_target.addWidget(self.target_input)
-        vbox.addLayout(hbox_target)
+        # 3) Target frequency input
+        target_hbox = QHBoxLayout()
+        target_hbox.addWidget(QLabel("Target Frequency (THz):"))
+        self.edit_target_freq = QLineEdit("0.00000")
+        target_hbox.addWidget(self.edit_target_freq)
+        layout.addLayout(target_hbox)
 
-        # Reading frequency input (in seconds)
-        hbox_freq = QHBoxLayout()
-        hbox_freq.addWidget(QLabel("Reading Frequency (sec):", self))
-        self.freq_input = QLineEdit(self)
-        hbox_freq.addWidget(self.freq_input)
-        vbox.addLayout(hbox_freq)
+        # 4) Fine Tuning checkbox
+        self.chk_fine_tuning = QCheckBox("Fine Tuning")
+        layout.addWidget(self.chk_fine_tuning)
 
-        # Button to update reading frequency
-        self.btn_update_freq = QPushButton("Update Reading Frequency", self)
-        vbox.addWidget(self.btn_update_freq, alignment=Qt.AlignCenter)
-        self.btn_update_freq.clicked.connect(self.on_update_read_freq)
+        # 5) Buttons: Lock/Unlock, Enable/Disable PID
+        button_hbox = QHBoxLayout()
+        self.btn_lock = QPushButton("Lock Etalon")
+        self.btn_unlock = QPushButton("Unlock Etalon")
+        button_hbox.addWidget(self.btn_lock)
+        button_hbox.addWidget(self.btn_unlock)
+        self.btn_enable_pid = QPushButton("Enable PID")
+        self.btn_disable_pid = QPushButton("Disable PID")
+        button_hbox.addWidget(self.btn_enable_pid)
+        button_hbox.addWidget(self.btn_disable_pid)
+        layout.addLayout(button_hbox)
 
-        # Buttons for lock/unlock, PID control, and updating PID parameters
-        hbox_buttons = QHBoxLayout()
-        self.btn_lock = QPushButton("Lock Etalon", self)
-        self.btn_unlock = QPushButton("Unlock Etalon", self)
-        hbox_buttons.addWidget(self.btn_lock)
-        hbox_buttons.addWidget(self.btn_unlock)
-        vbox.addLayout(hbox_buttons)
-
-        hbox_pid = QHBoxLayout()
-        self.btn_enable_pid = QPushButton("Enable PID", self)
-        self.btn_disable_pid = QPushButton("Disable PID", self)
-        hbox_pid.addWidget(self.btn_enable_pid)
-        hbox_pid.addWidget(self.btn_disable_pid)
-        vbox.addLayout(hbox_pid)
-
-        # Button to update PID parameters
-        self.btn_update_pid = QPushButton("Update PID Params", self)
-        vbox.addWidget(self.btn_update_pid, alignment=Qt.AlignCenter)
-
-        # Connect buttons to event handlers
+        # Connect signals to handlers
         self.btn_lock.clicked.connect(self.on_lock_etalon)
         self.btn_unlock.clicked.connect(self.on_unlock_etalon)
         self.btn_enable_pid.clicked.connect(self.on_enable_pid)
         self.btn_disable_pid.clicked.connect(self.on_disable_pid)
-        self.btn_update_pid.clicked.connect(self.on_update_pid_params)
+        self.chk_fine_tuning.stateChanged.connect(self.on_fine_tuning_changed)
 
-        # Create the minimal laser controller using configuration parameters
+        # Create the laser controller using parameters from CONFIG
         self.controller = self._create_laser_controller()
         self.controller.start()
 
-        # QTimer to update the etalon tuning value display
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_tune_label)
-        self.timer.start(100)  # update every 100 ms
+        # Timer to update GUI periodically
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.on_update_gui)
+        self.update_timer.start(500)  # update every 0.5 seconds
 
     def _create_laser_controller(self):
-        """Instantiate and return a MinimalLaserController using config values."""
+        """Instantiate the MinimalLaserController using values from CONFIG."""
         return MinimalLaserController(
-            IP_ADDRESS,
-            PORT,
-            WAVENUMBER_PV,
-            kp=KP,
-            ki=KI,
-            kd=KD
+            ip_address=CONFIG["ip_address"],
+            port=CONFIG["port"],
+            freq_pv=CONFIG["frequency_pv"],
+            pid_params=CONFIG["pid"],
+            read_freq=CONFIG["reading_frequency"],
+            update_delay=CONFIG["update_delay"],
+            ema_alpha=CONFIG["ema_alpha"]
         )
 
-    def update_tune_label(self):
-        """Poll and update the current etalon tuning value in the GUI."""
-        current_tune = self.controller.get_current_tuner_value()
-        if current_tune is not None:
-            self.tune_label.setText(f"Current Etalon Tune Value: {current_tune:.5f}")
-        else:
-            self.tune_label.setText("Current Etalon Tune Value: N/A")
+    ############################################################################
+    #                           GUI Event Handlers                             #
+    ############################################################################
 
     def on_lock_etalon(self):
         self.controller.lock_etalon()
-        self.status_label.setText(f"Etalon Lock Status: {self.controller.get_etalon_lock_status()}")
+        self.lbl_lock_status.setText(f"Etalon Lock Status: {self.controller.get_etalon_lock_status()}")
 
     def on_unlock_etalon(self):
         self.controller.unlock_etalon()
-        self.status_label.setText(f"Etalon Lock Status: {self.controller.get_etalon_lock_status()}")
+        self.lbl_lock_status.setText(f"Etalon Lock Status: {self.controller.get_etalon_lock_status()}")
 
     def on_enable_pid(self):
-        val_str = self.target_input.text()
         try:
-            target = float(val_str)
+            target_freq = float(self.edit_target_freq.text())
         except ValueError:
-            QMessageBox.critical(self, "Error", "Please enter a valid number for the target frequency.")
+            QMessageBox.critical(self, "Error", "Enter a valid numeric value for target frequency (THz).")
             return
-        self.controller.set_target_frequency(target)
+        self.controller.set_target_frequency(target_freq)
         self.controller.enable_pid()
 
     def on_disable_pid(self):
         self.controller.disable_pid()
 
-    def on_update_pid_params(self):
-        dialog = PIDParameterDialog(self)
-        if dialog.exec_() == QDialog.Accepted:
-            params = dialog.get_parameters()
-            if params is None:
-                QMessageBox.critical(self, "Error", "Please enter valid numeric values for PID parameters.")
-                return
-            kp, ki, kd = params
-            self.controller.update_pid_parameters(kp, ki, kd)
-            QMessageBox.information(self, "PID Update", "PID parameters have been updated.")
+    def on_fine_tuning_changed(self, state):
+        self.controller.fine_tuning = (state == Qt.Checked)
 
-    def on_update_read_freq(self):
-        freq_str = self.freq_input.text()
-        try:
-            new_freq = float(freq_str)
-            if new_freq <= 0:
-                raise ValueError("Frequency must be positive")
-            self.controller.reader.set_read_frequency(new_freq)
-            QMessageBox.information(self, "Update Frequency", f"Reading frequency updated to {new_freq} sec.")
-        except ValueError:
-            QMessageBox.critical(self, "Error", "Please enter a valid positive number for the reading frequency.")
+    def on_update_gui(self):
+        """Periodically update current frequency and lock status."""
+        current_freq = self.controller.reader.get_current_frequency()
+        self.lbl_current_freq.setText(f"{current_freq:.5f}")
+        lock_status = self.controller.get_etalon_lock_status()
+        self.lbl_lock_status.setText(f"Etalon Lock Status: {lock_status}")
 
     def closeEvent(self, event):
         """Ensure background threads are stopped before closing."""
         self.controller.stop()
         event.accept()
 
+###############################################################################
+#                                Main Application                             #
+###############################################################################
 
 def main():
     app = QApplication(sys.argv)
-    window = MinimalGUI()
+    window = MinimalLockGUI()
     window.show()
     sys.exit(app.exec_())
-
 
 if __name__ == "__main__":
     main()
